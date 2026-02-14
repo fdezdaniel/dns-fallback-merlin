@@ -1,0 +1,56 @@
+#!/bin/sh
+# Simple DNS fallback for Asuswrt-Merlin + Pi-hole/AdGuard/Unbound
+# Cron: */1 * * * * /jffs/scripts/dns-fallback
+
+# IP of your resolver (Pi-hole, AdGuard, etc.)
+RESOLVER_IP="192.168.1.100"  # CHANGE THIS
+
+# External DNS for fallback ONLY. Change DNS at your choice.
+FALLBACK_DNS1="1.1.1.1"
+FALLBACK_DNS2="8.8.8.8"
+
+# Domain used for DNS check
+DNS_TEST_DOMAIN="google.com"  
+
+#Log file path
+LOG_FILE="/jffs/dns-fallback.log"
+MAX_SIZE=50000  # ~50 KB
+
+log() {
+  if [ -n "$LOG_FILE" ]; then
+    if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt "$MAX_SIZE" ]; then
+      rm -f "$LOG_FILE"
+    fi
+    echo "[$(date '+%F %H:%M:%S')] $1" >> "$LOG_FILE"
+  fi
+}
+
+# Test PING + real DNS resolution
+ping -c1 -W1 "$RESOLVER_IP" >/dev/null 2>&1
+PING_OK=$?
+
+dig @"$RESOLVER_IP" "$DNS_TEST_DOMAIN" -t A +tries=1 +time=2 +short >/dev/null 2>&1
+DNS_OK=$?
+
+LAN_DNS1=$(nvram get dhcp_dns1_x)
+LAN_DNS2=$(nvram get dhcp_dns2_x)
+
+if [ "$PING_OK" -eq 0 ] && [ "$DNS_OK" -eq 0 ]; then
+  if [ "$LAN_DNS1" != "$RESOLVER_IP" ] || [ -n "$LAN_DNS2" ]; then
+    log "Resolver OK (ping:$PING_OK dns:$DNS_OK), restoring as sole LAN DNS"
+    nvram set dhcp_dns1_x="$RESOLVER_IP"
+    nvram set dhcp_dns2_x=""
+    nvram commit
+    service restart_dnsmasq  # Clears router cache
+    # /jffs/scripts/email-notify "✅ RESTORED → Resolver $RESOLVER_IP"  # Optional
+  fi
+else
+  if [ "$LAN_DNS1" = "$RESOLVER_IP" ] && [ -z "$LAN_DNS2" ]; then
+    log "Resolver DOWN (ping:$PING_OK dns:$DNS_OK), switching to fallback $FALLBACK_DNS1/$FALLBACK_DNS2"
+    nvram set dhcp_dns1_x="$FALLBACK_DNS1"
+    nvram set dhcp_dns2_x="$FALLBACK_DNS2"
+    nvram commit
+    service restart_dnsmasq
+    # /jffs/scripts/email-notify "🚨 DOWN → Fallback $FALLBACK_DNS1/$FALLBACK_DNS2"  # Optional
+  fi
+fi
