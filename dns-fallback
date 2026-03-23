@@ -1,0 +1,151 @@
+#!/bin/sh
+# Simple DNS fallback for Asuswrt-Merlin + Pi-hole/AdGuard/Unbound
+# Cron: */1 * * * * /jffs/scripts/dns-fallback
+
+# IP of your resolver (Pi-hole, AdGuard, etc.)
+RESOLVER_IP="192.168.1.100"  # CHANGE THIS
+
+# External DNS for fallback ONLY. Change DNS at your choice.
+FALLBACK_DNS1="1.1.1.1"
+FALLBACK_DNS2="8.8.8.8"
+
+# Domain used for DNS check
+DNS_TEST_DOMAIN="google.com"  
+
+#Log file path
+LOG_FILE="/jffs/dns-fallback.log"
+MAX_SIZE=50000  # ~50 KB
+
+# Hysteresis controls to reduce flap without delaying failover.
+# Failover stays fast by default (1 failed check), while restore
+# requires consecutive successful checks and a minimum fallback time.
+FAILOVER_FAILS_REQUIRED=1
+RESTORE_SUCCESSES_REQUIRED=2
+MIN_FALLBACK_SECONDS=90
+STATE_FILE="/jffs/dns-fallback.state"
+
+log() {
+  if [ -n "$LOG_FILE" ]; then
+    if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt "$MAX_SIZE" ]; then
+      tmp="$LOG_FILE.tmp"
+      tail -n 200 "$LOG_FILE" > "$tmp" && mv "$tmp" "$LOG_FILE"
+      rm -f "$tmp"
+    fi
+    echo "[$(date '+%F %H:%M:%S')] $1" >> "$LOG_FILE"
+  fi
+}
+
+save_state() {
+  tmp_state="${STATE_FILE}.$$"
+  {
+    echo "FAIL_STREAK=$FAIL_STREAK"
+    echo "OK_STREAK=$OK_STREAK"
+    echo "LAST_SWITCH_EPOCH=$LAST_SWITCH_EPOCH"
+  } > "$tmp_state" || {
+    rm -f "$tmp_state"
+    return 1
+  }
+  mv "$tmp_state" "$STATE_FILE" || {
+    rm -f "$tmp_state"
+    return 1
+  }
+}
+
+# Load state from previous executions with safe parsing (no sourcing).
+FAIL_STREAK=0
+OK_STREAK=0
+LAST_SWITCH_EPOCH=0
+if [ -f "$STATE_FILE" ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      FAIL_STREAK|OK_STREAK|LAST_SWITCH_EPOCH)
+        case "$value" in
+          ''|*[!0-9]*) ;; # Reject non-numeric
+          *)
+            case "$key" in
+              FAIL_STREAK) FAIL_STREAK=$value ;;
+              OK_STREAK) OK_STREAK=$value ;;
+              LAST_SWITCH_EPOCH) LAST_SWITCH_EPOCH=$value ;;
+            esac
+            ;;
+        esac
+        ;;
+    esac
+  done < "$STATE_FILE"
+fi
+
+# Save initial state to detect changes
+INITIAL_FAIL_STREAK=$FAIL_STREAK
+INITIAL_OK_STREAK=$OK_STREAK
+INITIAL_LAST_SWITCH_EPOCH=$LAST_SWITCH_EPOCH
+
+# Test PING + real DNS resolution
+ping -c1 -W1 "$RESOLVER_IP" >/dev/null 2>&1
+PING_OK=$?
+
+if command -v dig >/dev/null 2>&1; then
+  dig @"$RESOLVER_IP" "$DNS_TEST_DOMAIN" -t A +tries=1 +time=2 +short >/dev/null 2>&1
+else
+  nslookup "$DNS_TEST_DOMAIN" "$RESOLVER_IP" >/dev/null 2>&1
+fi
+DNS_OK=$?
+
+LAN_DNS1=$(nvram get dhcp_dns1_x)
+LAN_DNS2=$(nvram get dhcp_dns2_x)
+
+if [ "$PING_OK" -eq 0 ] && [ "$DNS_OK" -eq 0 ]; then
+  # Resolver is OK; reset fail counter regardless of current LAN DNS
+  FAIL_STREAK=0
+
+  if [ "$LAN_DNS1" != "$RESOLVER_IP" ] || [ -n "$LAN_DNS2" ]; then
+    # On fallback, increment OK counter toward restore
+    OK_STREAK=$((OK_STREAK + 1))
+
+    NOW_EPOCH=$(date +%s)
+    ELAPSED=$((NOW_EPOCH - LAST_SWITCH_EPOCH))
+
+    if [ "$ELAPSED" -lt "$MIN_FALLBACK_SECONDS" ]; then
+      if [ "$OK_STREAK" -eq 1 ]; then
+        log "Resolver OK but holding fallback for anti-flap window (${ELAPSED}s/${MIN_FALLBACK_SECONDS}s)"
+      fi
+    elif [ "$OK_STREAK" -ge "$RESTORE_SUCCESSES_REQUIRED" ]; then
+      log "Resolver OK (ping:$PING_OK dns:$DNS_OK), restoring as sole LAN DNS"
+      nvram set dhcp_dns1_x="$RESOLVER_IP"
+      nvram set dhcp_dns2_x=""
+      nvram commit
+      service restart_dnsmasq  # Clears router cache
+      LAST_SWITCH_EPOCH="$NOW_EPOCH"
+      OK_STREAK=0
+      # /jffs/scripts/email-notify "✅ RESTORED → Resolver $RESOLVER_IP"  # Optional
+    fi
+  fi
+else
+  # Resolver is DOWN
+  if [ "$LAN_DNS1" = "$RESOLVER_IP" ] && [ -z "$LAN_DNS2" ]; then
+    # Currently on resolver, increment fail counter toward failover
+    FAIL_STREAK=$((FAIL_STREAK + 1))
+
+    if [ "$FAIL_STREAK" -ge "$FAILOVER_FAILS_REQUIRED" ]; then
+      NOW_EPOCH=$(date +%s)
+      log "Resolver DOWN (ping:$PING_OK dns:$DNS_OK), switching to fallback $FALLBACK_DNS1/$FALLBACK_DNS2"
+      nvram set dhcp_dns1_x="$FALLBACK_DNS1"
+      nvram set dhcp_dns2_x="$FALLBACK_DNS2"
+      nvram commit
+      service restart_dnsmasq
+      LAST_SWITCH_EPOCH="$NOW_EPOCH"
+      FAIL_STREAK=0
+      # /jffs/scripts/email-notify "🚨 DOWN → Fallback $FALLBACK_DNS1/$FALLBACK_DNS2"  # Optional
+    fi
+  fi
+  # Reset OK counter whenever resolver is DOWN
+  OK_STREAK=0
+fi
+
+# Only persist state if counters/timestamps changed (reduce unnecessary JFFS writes)
+if [ "$FAIL_STREAK" != "$INITIAL_FAIL_STREAK" ] || [ "$OK_STREAK" != "$INITIAL_OK_STREAK" ] || [ "$LAST_SWITCH_EPOCH" != "$INITIAL_LAST_SWITCH_EPOCH" ]; then
+  save_state
+  if [ $? -ne 0 ]; then
+    log "ERROR: failed to persist state"
+    exit 1
+  fi
+fi
