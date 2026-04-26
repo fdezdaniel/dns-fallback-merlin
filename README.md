@@ -1,6 +1,6 @@
 # DNS Fallback for Asuswrt-Merlin
 
-Simple, reliable cron script (1min) for Pi-hole/AdGuard/Unbound failover on Asuswrt-Merlin routers. Monitors resolver with ping+dig, auto-switches LAN DHCP DNS to public fallbacks (Cloudflare/Google/etc.) on failure. Restores with anti-flap hysteresis (consecutive OK checks + minimum fallback window). Log rotation & optional email included. No dependencies beyond Merlin+JFFS.
+Simple, reliable cron script (1min) for Pi-hole/AdGuard/Unbound failover on Asuswrt-Merlin routers. Monitors resolver with ping+dig, auto-switches LAN DHCP DNS to public fallbacks (Cloudflare/Google/etc.) on failure. Restores with consecutive OK checks + minimum fallback window. Log rotation & optional email included. No dependencies beyond Merlin+JFFS.
 
 ## Features
 - **Real DNS test**: dig + ping
